@@ -22,6 +22,11 @@ An MCP (Model Context Protocol) server that exposes Jenkins CI/CD operations as 
 ## Installation
 
 ```bash
+git clone https://github.com/HagopA/jenkins-mcp.git
+cd jenkins-mcp
+
+python -m venv .venv
+source .venv/bin/activate        # On Windows: .venv\Scripts\activate
 pip install mcp requests python-dotenv
 ```
 
@@ -56,20 +61,19 @@ INSTANCES = {
 }
 ```
 
-## Usage with Claude Desktop
+## Usage with Claude
 
-Add the following to your Claude Desktop MCP config (`claude_desktop_config.json`):
+Register the server with Claude using the `claude mcp add` command, pointing to the venv's Python interpreter so dependencies are available:
 
-```json
-{
-  "mcpServers": {
-    "jenkins": {
-      "command": "python",
-      "args": ["/path/to/jenkins_mcp.py"]
-    }
-  }
-}
+```bash
+# macOS / Linux
+claude mcp add jenkins /absolute/path/to/.venv/bin/python /absolute/path/to/jenkins_mcp.py
+
+# Windows
+claude mcp add jenkins /absolute/path/to/.venv/Scripts/python /absolute/path/to/jenkins_mcp.py
 ```
+
+Once added, Claude will automatically start the MCP server on each new session — no manual config editing required.
 
 ## Available Tools
 
