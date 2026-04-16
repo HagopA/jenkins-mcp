@@ -1,45 +1,98 @@
-# jenkins-mcp
+# Jenkins MCP Server for Claude Code
 
-An MCP (Model Context Protocol) server that exposes Jenkins CI/CD operations as tools, allowing AI assistants like Claude to interact with one or more Jenkins instances directly.
+A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that connects
+Claude Code directly to Jenkins CI/CD. Once registered, Claude can fetch logs, diagnose
+build failures, trigger jobs, and inspect artifacts conversationally — without leaving
+the editor.
 
-## Features
+Claude Code auto-starts the server in the background — you never need to start it manually.
 
-- Search jobs across all instances, including nested folders
-- List all jobs and their statuses
-- Trigger builds with or without parameters
-- Cancel builds individually or by user
-- Get build logs, failure tails, and console search
-- View build history and success rates
-- Monitor running builds and queue status
-- Resolve queue items to build numbers
+## Tools
 
-## Requirements
+| Tool | Description |
+|---|---|
+| `get_job_parameters` | Retrieve parameter definitions for a job |
+| `trigger_build_on_all` | Trigger a build with optional parameters |
+| `get_build_history_from_all` | Recent build history, including who triggered each build |
+| `get_failure_log` | Tail a build's console log (default: last 50 lines) |
+| `search_build_log` | Search a console log for a keyword with surrounding context |
+| `list_artifacts` | List all artifacts attached to a build |
+| `get_artifact_content` | Download and tail a build artifact file |
+| `search_artifact_content` | Search for a keyword inside a build artifact |
+
+## How It Works
+
+```
+Claude Code ──(MCP stdio)──► jenkins_mcp.py ──(HTTPS + API token)──► Jenkins REST API
+```
+
+1. Claude issues a tool call over stdio (the MCP transport).
+2. `jenkins_mcp.py` translates it into one or more Jenkins JSON API requests authenticated
+   with `HTTPBasicAuth`.
+3. Results are returned as structured data that Claude reasons over directly.
+
+### Multi-instance support
+
+The server maintains a named registry of Jenkins instances. Every tool accepts an optional
+`instance_name` parameter:
+
+- **Provided** — targets that instance only.
+- **Omitted** — fans out across all configured instances simultaneously.
+
+This lets a single MCP registration serve an organization with multiple Jenkins servers
+(e.g. per-team or per-release-stream instances).
+
+---
+
+## Setup
+
+### Prerequisites
 
 - Python 3.10+
-- One or more Jenkins instances with API access
-- A Jenkins API token per instance
+- [Claude Code](https://claude.ai/claude-code) CLI
+- A Jenkins API token for each instance — generate one at:
+  **Jenkins → your user → Configure → API Token**
 
-## Installation
+### 1. Create a virtual environment
+
+Run this once from the folder where `jenkins_mcp.py` lives:
 
 ```bash
-git clone https://github.com/HagopA/jenkins-mcp.git
-cd jenkins-mcp
-
 python -m venv .venv
-source .venv/bin/activate        # On Windows: .venv\Scripts\activate
+```
+
+Activate it:
+
+```bash
+# Mac / Linux
+source .venv/bin/activate
+
+# Windows
+.venv\Scripts\activate
+```
+
+> **Windows:** If you see a "running scripts is disabled on this system" error, run this
+> once first, then activate:
+> ```powershell
+> Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+> ```
+
+### 2. Install dependencies
+
+With the venv active:
+
+```bash
 pip install mcp requests python-dotenv
 ```
 
-## Configuration
+### 3. Create your `.env` file
 
-Copy `.env.example` to `.env` and fill in your credentials:
-
-```bash
-cp .env.example .env
-```
+In the same folder as `jenkins_mcp.py`, create a file named `.env`. **Keep this file
+private — never share or commit it.**
 
 ```env
 JENKINS_USER=your.name@example.com
+
 JENKINS_TOKEN_INTEGRATION=your_api_token_here
 JENKINS_TOKEN_STAGING=your_api_token_here
 JENKINS_TOKEN_TEAMS=your_api_token_here
@@ -48,50 +101,172 @@ JENKINS_TOKEN_CI=your_api_token_here
 JENKINS_TOKEN_PRODUCTION=your_api_token_here
 ```
 
-Then update the `INSTANCES` dictionary in `jenkins_mcp.py` with your Jenkins URLs and corresponding environment variable names:
+The server reads credentials from `.env` automatically via `python-dotenv`. No secrets
+live in the code.
 
-```python
-INSTANCES = {
-    "my-instance": {
-        "url": "https://jenkins.example.com",
-        "user": _USER,
-        "token": os.environ["JENKINS_TOKEN_MY_INSTANCE"],
-    },
-    # add more instances as needed
-}
+### 4. Configure `CLAUDE.md`
+
+Claude Code reads `~/.claude/CLAUDE.md` at session start for behavioral instructions.
+Add the following block to configure how Claude interacts with Jenkins:
+
+```markdown
+## Jenkins
+
+If no Jenkins instance has been established in the conversation, ask the user which
+instance they mean before making any tool calls. Present the available options:
+
+- integration
+- staging
+- teams
+- k8s_pipeline
+- ci
+- production
+
+Once an instance is established in the conversation, continue using it for subsequent
+tool calls unless told otherwise.
+
+When the user asks why a specific job is failing, call `get_failure_log` directly.
+If the log identifies a failing subjob, automatically call `get_failure_log` on that
+subjob too — keep following the chain until the root cause is found. Do not ask for
+permission at each step.
 ```
 
-## Usage with Claude
+### 5. Register with Claude Code
 
-Register the server with Claude using the `claude mcp add` command, pointing to the venv's Python interpreter so dependencies are available:
+Run this once. Replace the paths with the actual locations of your `.venv` and
+`jenkins_mcp.py`:
 
 ```bash
-# macOS / Linux
-claude mcp add jenkins /absolute/path/to/.venv/bin/python /absolute/path/to/jenkins_mcp.py
+# Mac / Linux
+claude mcp add --scope user jenkins -- /path/to/jenkins/.venv/bin/python /path/to/jenkins/jenkins_mcp.py
 
 # Windows
-claude mcp add jenkins /absolute/path/to/.venv/Scripts/python /absolute/path/to/jenkins_mcp.py
+claude mcp add --scope user jenkins -- C:\path\to\jenkins\.venv\Scripts\python.exe C:\path\to\jenkins\jenkins_mcp.py
 ```
 
-Once added, Claude will automatically start the MCP server on each new session — no manual config editing required.
+That's it. Claude Code will automatically start the server at the beginning of every
+session using the venv's Python — no manual startup needed.
 
-## Available Tools
+---
 
-| Tool | Description |
-|------|-------------|
-| `list_all_jobs` | List all jobs across all instances |
-| `search_all_jobs` | Search jobs by keyword, including inside folders |
-| `get_job_status_from_all` | Get the last build status of a job across all instances |
-| `get_job_parameters` | Get parameter definitions for a job |
-| `trigger_build_on_all` | Trigger a build, optionally on a specific instance with parameters |
-| `get_build_number_from_queue` | Resolve a queue URL to an actual build number |
-| `cancel_build` | Cancel/abort a specific build |
-| `cancel_builds_by_user` | Cancel all running builds triggered by a user |
-| `get_build_log_from_all` | Get the console log of a specific build |
-| `get_failure_log` | Get the tail of a build log (useful for diagnosing failures) |
-| `search_build_log` | Search for a keyword in a build log with context |
-| `get_build_history_from_all` | Get recent build history including who triggered each build |
-| `get_running_builds` | Get all currently running builds |
-| `get_queue_status` | Get all items currently waiting in the queue |
-| `get_build_success_rate` | Get success/failure/abort rates over the last N builds |
-| `search_builds_by_user` | Find recent builds triggered by a specific user |
+## Tools Reference
+
+Some tools are designed to be called by Claude internally as part of a reasoning chain,
+rather than invoked via a specific prompt. For example, asking *"Why did this build fail?"*
+will cause Claude to call `get_failure_log`, follow any failing subjobs, and if the console
+log is too high-level, automatically chain into `list_artifacts` → `search_artifact_content`
+to find the root cause — all without you needing to name the tools.
+
+The descriptions below are useful when you want to target a specific tool directly (e.g.,
+"List the artifacts for build 2466").
+
+### Triggering
+
+#### `trigger_build_on_all`
+
+Trigger a build for a job on a specific instance. Claude calls `get_job_parameters` first
+to present available parameters before triggering.
+
+| Parameter | Required | Description |
+|---|---|---|
+| `job_name` | Yes | Exact job name |
+| `instance_name` | Yes | Instance name |
+| `parameters` | No | JSON string of build parameters, e.g. `{"PARAM1": "value1"}` |
+
+#### `get_job_parameters`
+
+Get a job's parameter definitions. Claude calls this automatically before triggering a
+parameterized build.
+
+| Parameter | Required | Description |
+|---|---|---|
+| `job_name` | Yes | Exact job name |
+| `instance_name` | Yes | Instance name |
+
+### History
+
+#### `get_build_history_from_all`
+
+Recent build history (last 20) for a job, including who triggered each build.
+
+| Parameter | Required | Description |
+|---|---|---|
+| `job_name` | Yes | Exact job name |
+| `instance_name` | Yes | Instance name |
+
+### Log Inspection
+
+#### `get_failure_log`
+
+Get the tail of the console log for a completed build. Claude uses this automatically
+when diagnosing failures and chains through failing subjobs to find the root cause.
+
+| Parameter | Required | Description |
+|---|---|---|
+| `job_name` | Yes | Exact job name |
+| `instance_name` | Yes | Instance name |
+| `build_number` | No | Defaults to `lastBuild` |
+| `tail_lines` | No | Defaults to `50` |
+
+#### `search_build_log`
+
+Search for a keyword in a build's console log. Returns matching lines with 2 lines of
+surrounding context (up to 20 matches).
+
+| Parameter | Required | Description |
+|---|---|---|
+| `job_name` | Yes | Exact job name |
+| `instance_name` | Yes | Instance name |
+| `keyword` | Yes | Search term (case-insensitive) |
+| `build_number` | No | Defaults to `lastBuild` |
+
+### Artifacts
+
+#### `list_artifacts`
+
+List all artifacts available for a build.
+
+| Parameter | Required | Description |
+|---|---|---|
+| `job_name` | Yes | Exact job name |
+| `instance_name` | Yes | Instance name |
+| `build_number` | No | Defaults to `lastBuild` |
+
+#### `get_artifact_content`
+
+Get the tail of a build artifact file. Use `list_artifacts` first to find the artifact
+path. Defaults to last 100 lines to avoid large payloads.
+
+| Parameter | Required | Description |
+|---|---|---|
+| `job_name` | Yes | Exact job name |
+| `instance_name` | Yes | Instance name |
+| `artifact_path` | Yes | Relative artifact path (from `list_artifacts`) |
+| `build_number` | No | Defaults to `lastBuild` |
+| `tail_lines` | No | Defaults to `100` |
+
+#### `search_artifact_content`
+
+Search for a keyword in a build artifact file. Returns matching lines with surrounding
+context (up to 20 matches).
+
+| Parameter | Required | Description |
+|---|---|---|
+| `job_name` | Yes | Exact job name |
+| `instance_name` | Yes | Instance name |
+| `artifact_path` | Yes | Relative artifact path (from `list_artifacts`) |
+| `keyword` | Yes | Search term (case-insensitive) |
+| `build_number` | No | Defaults to `lastBuild` |
+
+---
+
+## Notes
+
+- **Credentials:** Stored in `.env` alongside `jenkins_mcp.py`. Keep this file private —
+  never share or commit it.
+- **Auto-start:** Once registered, Claude Code spawns the server automatically at session
+  start using the venv Python you specified. You never need to activate the venv or start
+  the server manually.
+- **Folder support:** Jobs inside Jenkins folders are found automatically — you never need
+  to type a folder path. If a keyword matches multiple jobs across folders or instances,
+  Claude will list them and ask which one you meant.
