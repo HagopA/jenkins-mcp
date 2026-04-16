@@ -9,34 +9,40 @@ load_dotenv()
 
 _USER = os.environ["JENKINS_USER"]
 
+# ---------------------------------------------------------------------------
+# Instance registry
+# Add or remove entries here to match your Jenkins infrastructure.
+# Each key becomes the value you pass as ``instance_name`` in tool calls.
+# ---------------------------------------------------------------------------
+
 INSTANCES = {
     "integration": {
-        "url": "https://jenkins-integration.example.com",
+        "url": os.environ.get("JENKINS_URL_INTEGRATION", "https://jenkins-integration.example.com"),
         "user": _USER,
         "token": os.environ["JENKINS_TOKEN_INTEGRATION"],
     },
     "staging": {
-        "url": "https://jenkins-staging.example.com",
+        "url": os.environ.get("JENKINS_URL_STAGING", "https://jenkins-staging.example.com"),
         "user": _USER,
         "token": os.environ["JENKINS_TOKEN_STAGING"],
     },
     "teams": {
-        "url": "https://jenkins-teams.example.com",
+        "url": os.environ.get("JENKINS_URL_TEAMS", "https://jenkins-teams.example.com"),
         "user": _USER,
         "token": os.environ["JENKINS_TOKEN_TEAMS"],
     },
-    "k8s-pipeline": {
-        "url": "https://jenkins-k8s-pipeline.example.com",
+    "k8s_pipeline": {
+        "url": os.environ.get("JENKINS_URL_K8S_PIPELINE", "https://jenkins-k8s-pipeline.example.com"),
         "user": _USER,
         "token": os.environ["JENKINS_TOKEN_K8S_PIPELINE"],
     },
     "ci": {
-        "url": "https://jenkins-ci.example.com",
+        "url": os.environ.get("JENKINS_URL_CI", "https://jenkins-ci.example.com"),
         "user": _USER,
         "token": os.environ["JENKINS_TOKEN_CI"],
     },
     "production": {
-        "url": "https://jenkins-production.example.com",
+        "url": os.environ.get("JENKINS_URL_PRODUCTION", "https://jenkins-production.example.com"),
         "user": _USER,
         "token": os.environ["JENKINS_TOKEN_PRODUCTION"],
     },
@@ -45,11 +51,16 @@ INSTANCES = {
 mcp = FastMCP("jenkins")
 
 
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
 def get_auth(instance: dict) -> HTTPBasicAuth:
     return HTTPBasicAuth(instance["user"], instance["token"])
 
 
 def jenkins_get(instance: dict, path: str) -> dict:
+    """Perform an authenticated GET against the Jenkins JSON API."""
     r = requests.get(
         f"{instance['url']}{path}",
         auth=get_auth(instance),
@@ -59,102 +70,42 @@ def jenkins_get(instance: dict, path: str) -> dict:
     return r.json()
 
 
-@mcp.tool()
-def search_all_jobs(keyword: str) -> list:
-    """Search for jobs matching a keyword across all Jenkins instances, including jobs inside folders"""
-    def collect_jobs(instance, path="/", job_path_prefix=""):
-        try:
-            url_path = f"{path}api/json?tree=jobs[name,url,color,jobs[name,url,color,jobs[name,url,color]]]"
-            data = jenkins_get(instance, url_path)
-            found = []
-            for job in data.get("jobs", []):
-                job_path = f"{job_path_prefix}{job['name']}" if not job_path_prefix else f"{job_path_prefix}/job/{job['name']}"
-                if keyword.lower() in job["name"].lower():
-                    found.append({**job, "job_path": job_path})
-                if job.get("jobs") is not None:
-                    for subjob in job.get("jobs", []):
-                        subjob_path = f"{job_path}/job/{subjob['name']}"
-                        if keyword.lower() in subjob["name"].lower():
-                            found.append({**subjob, "job_path": subjob_path})
-                        if subjob.get("jobs") is not None:
-                            for subsubjob in subjob.get("jobs", []):
-                                subsubjob_path = f"{subjob_path}/job/{subsubjob['name']}"
-                                if keyword.lower() in subsubjob["name"].lower():
-                                    found.append({**subsubjob, "job_path": subsubjob_path})
-            return found
-        except Exception as e:
-            return [{"error": str(e)}]
+def _resolve_targets(instance_name: str | None) -> dict:
+    """Return a {name: config} dict for the requested instance(s).
 
-    results = []
-    for name, instance in INSTANCES.items():
-        try:
-            matches = collect_jobs(instance)
-            for m in matches:
-                results.append({**m, "instance": name})
-        except Exception as e:
-            results.append({"instance": name, "error": str(e)})
-    return results
+    If *instance_name* is provided and valid, returns only that instance.
+    If omitted or None, returns all configured instances (fan-out behaviour).
+    """
+    if instance_name and instance_name in INSTANCES:
+        return {instance_name: INSTANCES[instance_name]}
+    return INSTANCES
 
+
+# ---------------------------------------------------------------------------
+# Tool: get_job_parameters
+# ---------------------------------------------------------------------------
 
 @mcp.tool()
-def get_job_status_from_all(job_name: str) -> list:
-    """Find and return the status of a job across all Jenkins instances"""
+def get_job_parameters(job_name: str, instance_name: str = None) -> list:
+    """Get the parameter definitions for a job on a Jenkins instance.
+
+    Args:
+        job_name: The Jenkins job name (e.g. ``MyPipeline`` or ``folder/MyJob``).
+        instance_name: Target a specific instance by name (see INSTANCES keys).
+                       If omitted, all instances are queried.
+
+    Returns:
+        List of ``{"instance": str, "parameters": [...]}`` entries for each
+        instance where the job exists.
+    """
+    targets = _resolve_targets(instance_name)
     results = []
-    for name, instance in INSTANCES.items():
-        try:
-            data = jenkins_get(instance, f"/job/{job_name}/lastBuild/api/json")
-            results.append({"instance": name, **data})
-        except requests.HTTPError as e:
-            if e.response.status_code != 404:
-                results.append({"instance": name, "error": str(e)})
-        except Exception as e:
-            results.append({"instance": name, "error": str(e)})
-    return results
-
-
-@mcp.tool()
-def list_all_jobs() -> list:
-    """List all jobs from all Jenkins instances"""
-    results = []
-    for name, instance in INSTANCES.items():
-        try:
-            data = jenkins_get(instance, "/api/json?tree=jobs[name,url,color]")
-            for job in data.get("jobs", []):
-                results.append({**job, "instance": name})
-        except Exception as e:
-            results.append({"instance": name, "error": str(e)})
-    return results
-
-
-@mcp.tool()
-def get_build_log_from_all(job_name: str, build_number: int) -> list:
-    """Get the console log of a specific build across all Jenkins instances"""
-    results = []
-    for name, instance in INSTANCES.items():
-        try:
-            r = requests.get(
-                f"{instance['url']}/job/{job_name}/{build_number}/consoleText",
-                auth=get_auth(instance),
-                timeout=10,
-            )
-            if r.status_code == 404:
-                continue
-            r.raise_for_status()
-            results.append({"instance": name, "log": r.text[:5000]})
-        except Exception as e:
-            results.append({"instance": name, "error": str(e)})
-    return results
-
-
-@mcp.tool()
-def get_job_parameters(job_name: str) -> list:
-    """Get the parameter definitions for a job across all Jenkins instances where it exists"""
-    results = []
-    for name, instance in INSTANCES.items():
+    for name, instance in targets.items():
         try:
             data = jenkins_get(
                 instance,
-                f"/job/{job_name}/api/json?tree=property[parameterDefinitions[name,type,defaultParameterValue[value],description]]"
+                f"/job/{job_name}/api/json"
+                "?tree=property[parameterDefinitions[name,type,defaultParameterValue[value],description]]",
             )
             param_defs = []
             for prop in data.get("property", []):
@@ -171,10 +122,28 @@ def get_job_parameters(job_name: str) -> list:
     return results
 
 
+# ---------------------------------------------------------------------------
+# Tool: trigger_build_on_all
+# ---------------------------------------------------------------------------
+
 @mcp.tool()
-def trigger_build_on_all(job_name: str, instance_name: str = None, parameters: str = None) -> list:
-    """Trigger a build for a job. Optionally target a specific instance and/or pass parameters as a JSON string, e.g. '{"PARAM1": "value1"}'"""
-    targets = {instance_name: INSTANCES[instance_name]} if instance_name and instance_name in INSTANCES else INSTANCES
+def trigger_build_on_all(
+    job_name: str,
+    instance_name: str = None,
+    parameters: str = None,
+) -> list:
+    """Trigger a build for a job on one or all Jenkins instances.
+
+    Args:
+        job_name: The Jenkins job name.
+        instance_name: Target a specific instance. If omitted, triggers on all.
+        parameters: Optional JSON string of build parameters,
+                    e.g. ``'{"BRANCH": "main", "RUN_TESTS": "true"}'``.
+
+    Returns:
+        List of ``{"instance": str, "status": str}`` entries.
+    """
+    targets = _resolve_targets(instance_name)
     params = json.loads(parameters) if parameters else None
     results = []
     for name, instance in targets.items():
@@ -195,13 +164,7 @@ def trigger_build_on_all(job_name: str, instance_name: str = None, parameters: s
             if r.status_code == 404:
                 continue
             if r.status_code in (200, 201):
-                queue_url = r.headers.get("Location", "")
-                results.append({
-                    "instance": name,
-                    "status": f"Build triggered for {job_name}",
-                    "queue_url": queue_url,
-                    "note": "Use get_build_number_from_queue to resolve the actual build number before cancelling."
-                })
+                results.append({"instance": name, "status": f"Build triggered for {job_name}"})
             else:
                 results.append({"instance": name, "status": f"Failed: {r.status_code}"})
         except Exception as e:
@@ -209,81 +172,54 @@ def trigger_build_on_all(job_name: str, instance_name: str = None, parameters: s
     return results
 
 
-@mcp.tool()
-def get_build_number_from_queue(instance_name: str, queue_url: str) -> dict:
-    """Resolve a queue item URL to an actual build number. Call this after trigger_build_on_all to get the specific build number before cancelling."""
-    if instance_name not in INSTANCES:
-        return {"error": f"Unknown instance: {instance_name}"}
-    instance = INSTANCES[instance_name]
-    try:
-        # Extract queue item path from full URL
-        path = queue_url.replace(instance["url"], "").rstrip("/")
-        r = requests.get(
-            f"{instance['url']}{path}/api/json",
-            auth=get_auth(instance),
-            timeout=10,
-        )
-        r.raise_for_status()
-        data = r.json()
-        executable = data.get("executable")
-        if executable:
-            return {
-                "instance": instance_name,
-                "build_number": executable["number"],
-                "build_url": executable["url"],
-            }
-        return {"instance": instance_name, "status": "Build not started yet — still in queue. Try again in a moment."}
-    except Exception as e:
-        return {"instance": instance_name, "error": str(e)}
-
+# ---------------------------------------------------------------------------
+# Tool: get_build_history_from_all
+# ---------------------------------------------------------------------------
 
 @mcp.tool()
-def cancel_build(job_name: str, instance_name: str, build_number: str = "lastBuild") -> dict:
-    """Cancel/abort a running build. Defaults to the last build if no build number is provided."""
-    if instance_name not in INSTANCES:
-        return {"error": f"Unknown instance: {instance_name}"}
-    instance = INSTANCES[instance_name]
-    try:
-        r = requests.post(
-            f"{instance['url']}/job/{job_name}/{build_number}/stop",
-            auth=get_auth(instance),
-            timeout=10,
-        )
-        if r.status_code in (200, 201, 302):
-            return {"instance": instance_name, "status": f"Build {build_number} cancelled for {job_name}"}
-        return {"instance": instance_name, "status": f"Failed: {r.status_code}"}
-    except Exception as e:
-        return {"instance": instance_name, "error": str(e)}
+def get_build_history_from_all(job_name: str, instance_name: str = None) -> list:
+    """Get recent build history for a job, including who triggered each build.
 
+    Queries the last 20 builds and flattens the ``causes`` action so the
+    triggering user is surfaced at the top level of each build entry.
 
-@mcp.tool()
-def get_build_history_from_all(job_name: str) -> list:
-    """Get recent build history for a job across all Jenkins instances, including who triggered each build"""
+    Args:
+        job_name: The Jenkins job name.
+        instance_name: Target a specific instance. If omitted, queries all.
+
+    Returns:
+        List of ``{"instance": str, "builds": [...]}`` entries.
+    """
+    targets = _resolve_targets(instance_name)
     results = []
-    for name, instance in INSTANCES.items():
+    for name, instance in targets.items():
         try:
             data = jenkins_get(
                 instance,
-                f"/job/{job_name}/api/json?tree=builds[number,result,timestamp,duration,building,actions[causes[userId,userName]]]{{0,20}}"
+                f"/job/{job_name}/api/json"
+                "?tree=builds[number,result,timestamp,duration,building,"
+                "actions[causes[userId,userName]]]{0,20}",
             )
             builds = data.get("builds", [])
             if builds:
-                # Flatten causes into each build for easier reading
                 simplified = []
                 for b in builds:
-                    causes = []
-                    for action in b.get("actions", []):
-                        for cause in action.get("causes", []):
-                            if "userId" in cause:
-                                causes.append(cause)
-                    simplified.append({
-                        "number": b["number"],
-                        "result": b.get("result"),
-                        "building": b.get("building"),
-                        "duration": b.get("duration"),
-                        "timestamp": b.get("timestamp"),
-                        "triggered_by": causes,
-                    })
+                    causes = [
+                        cause
+                        for action in b.get("actions", [])
+                        for cause in action.get("causes", [])
+                        if "userId" in cause
+                    ]
+                    simplified.append(
+                        {
+                            "number": b["number"],
+                            "result": b.get("result"),
+                            "building": b.get("building"),
+                            "duration": b.get("duration"),
+                            "timestamp": b.get("timestamp"),
+                            "triggered_by": causes,
+                        }
+                    )
                 results.append({"instance": name, "builds": simplified})
         except requests.HTTPError as e:
             if e.response.status_code != 404:
@@ -293,92 +229,33 @@ def get_build_history_from_all(job_name: str) -> list:
     return results
 
 
+# ---------------------------------------------------------------------------
+# Tool: get_failure_log
+# ---------------------------------------------------------------------------
+
 @mcp.tool()
-def cancel_builds_by_user(job_name: str, instance_name: str, username: str = _USER, limit: int = None) -> list:
-    """Cancel running builds triggered by a specific user. Use limit to cancel only the last N builds, or omit to cancel all running builds by that user."""
+def get_failure_log(
+    job_name: str,
+    instance_name: str,
+    build_number: str = "lastBuild",
+    tail_lines: int = 50,
+) -> dict:
+    """Fetch the tail of the console log for a build — ideal for diagnosing failures.
+
+    Waits until the build is complete before returning (returns a ``"still running"``
+    message if the build has not finished yet).
+
+    Args:
+        job_name: The Jenkins job name.
+        instance_name: The target Jenkins instance (required).
+        build_number: Build number or ``"lastBuild"`` (default).
+        tail_lines: Number of lines from the end of the log to return (default 50).
+
+    Returns:
+        Dict with ``instance``, ``build_number``, ``result``, and ``log_tail``.
+    """
     if instance_name not in INSTANCES:
-        return [{"error": f"Unknown instance: {instance_name}"}]
-    instance = INSTANCES[instance_name]
-    results = []
-    try:
-        data = jenkins_get(
-            instance,
-            f"/job/{job_name}/api/json?tree=builds[number,result,building,actions[causes[userId]]]{{0,100}}"
-        )
-        builds = data.get("builds", [])
-
-        # Filter to running builds triggered by the specified user
-        matching = []
-        for b in builds:
-            if not b.get("building"):
-                continue
-            for action in b.get("actions", []):
-                for cause in action.get("causes", []):
-                    if cause.get("userId", "").lower() == username.lower():
-                        matching.append(b["number"])
-                        break
-
-        if limit:
-            matching = matching[:limit]
-
-        if not matching:
-            return [{"instance": instance_name, "status": f"No running builds found for user '{username}' in {job_name}"}]
-
-        for build_number in matching:
-            r = requests.post(
-                f"{instance['url']}/job/{job_name}/{build_number}/stop",
-                auth=get_auth(instance),
-                timeout=10,
-            )
-            if r.status_code in (200, 201, 302):
-                results.append({"instance": instance_name, "build": build_number, "status": "Cancelled"})
-            else:
-                results.append({"instance": instance_name, "build": build_number, "status": f"Failed: {r.status_code}"})
-    except Exception as e:
-        results.append({"instance": instance_name, "error": str(e)})
-    return results
-
-
-@mcp.tool()
-def get_running_builds(instance_name: str = None) -> list:
-    """Get all currently running builds across all (or a specific) Jenkins instance"""
-    targets = {instance_name: INSTANCES[instance_name]} if instance_name and instance_name in INSTANCES else INSTANCES
-    results = []
-    for name, instance in targets.items():
-        try:
-            data = jenkins_get(
-                instance,
-                "/api/json?tree=jobs[name,builds[number,building,timestamp,url,actions[causes[userId,userName]]]{0,5}]"
-            )
-            running = []
-            for job in data.get("jobs", []):
-                for build in job.get("builds", []):
-                    if not build.get("building"):
-                        continue
-                    causes = []
-                    for action in build.get("actions", []):
-                        for cause in action.get("causes", []):
-                            if "userId" in cause:
-                                causes.append(cause)
-                    running.append({
-                        "job": job["name"],
-                        "build_number": build["number"],
-                        "triggered_by": causes,
-                        "timestamp": build.get("timestamp"),
-                        "url": build.get("url"),
-                    })
-            if running:
-                results.append({"instance": name, "running_builds": running})
-        except Exception as e:
-            results.append({"instance": name, "error": str(e)})
-    return results
-
-
-@mcp.tool()
-def get_failure_log(job_name: str, instance_name: str, build_number: str = "lastBuild", tail_lines: int = 50) -> dict:
-    """Get the tail of the console log for a build. Useful for diagnosing failures. Defaults to the last build."""
-    if instance_name not in INSTANCES:
-        return {"error": f"Unknown instance: {instance_name}"}
+        return {"error": f"Unknown instance: {instance_name}. Available: {list(INSTANCES)}"}
     instance = INSTANCES[instance_name]
     try:
         data = jenkins_get(instance, f"/job/{job_name}/{build_number}/api/json")
@@ -401,121 +278,34 @@ def get_failure_log(job_name: str, instance_name: str, build_number: str = "last
         return {"instance": instance_name, "error": str(e)}
 
 
-@mcp.tool()
-def search_builds_by_user(username: str = _USER, instance_name: str = None, limit: int = 20) -> list:
-    """Search recent builds triggered by a specific user across all (or a specific) Jenkins instance."""
-    targets = {instance_name: INSTANCES[instance_name]} if instance_name and instance_name in INSTANCES else INSTANCES
-    results = []
-    for name, instance in targets.items():
-        try:
-            data = jenkins_get(
-                instance,
-                "/api/json?tree=jobs[name,builds[number,result,building,timestamp,duration,actions[causes[userId,userName]]]{0,50}]"
-            )
-            matches = []
-            for job in data.get("jobs", []):
-                for build in job.get("builds", []):
-                    for action in build.get("actions", []):
-                        for cause in action.get("causes", []):
-                            if cause.get("userId", "").lower() == username.lower():
-                                matches.append({
-                                    "job": job["name"],
-                                    "build_number": build["number"],
-                                    "result": build.get("result"),
-                                    "building": build.get("building"),
-                                    "timestamp": build.get("timestamp"),
-                                    "duration": build.get("duration"),
-                                })
-                                break
-            matches = matches[:limit]
-            if matches:
-                results.append({"instance": name, "builds": matches})
-        except Exception as e:
-            results.append({"instance": name, "error": str(e)})
-    return results
-
+# ---------------------------------------------------------------------------
+# Tool: search_build_log
+# ---------------------------------------------------------------------------
 
 @mcp.tool()
-def get_queue_status(instance_name: str = None) -> list:
-    """Get all items currently waiting in the Jenkins queue across all (or a specific) instance."""
-    targets = {instance_name: INSTANCES[instance_name]} if instance_name and instance_name in INSTANCES else INSTANCES
-    results = []
-    for name, instance in targets.items():
-        try:
-            data = jenkins_get(
-                instance,
-                "/queue/api/json?tree=items[id,why,blocked,stuck,task[name,url],actions[causes[userId,userName],parameters[name,value]]]"
-            )
-            items = data.get("items", [])
-            queue_items = []
-            for item in items:
-                causes = []
-                params = {}
-                for action in item.get("actions", []):
-                    for cause in action.get("causes", []):
-                        if "userId" in cause:
-                            causes.append(cause)
-                    for p in action.get("parameters", []):
-                        if "value" in p:
-                            params[p["name"]] = p["value"]
-                queue_items.append({
-                    "id": item["id"],
-                    "job": item.get("task", {}).get("name"),
-                    "why": item.get("why"),
-                    "blocked": item.get("blocked"),
-                    "stuck": item.get("stuck"),
-                    "triggered_by": causes,
-                    "parameters": params,
-                })
-            results.append({"instance": name, "queue": queue_items})
-        except Exception as e:
-            results.append({"instance": name, "error": str(e)})
-    return results
+def search_build_log(
+    job_name: str,
+    instance_name: str,
+    keyword: str,
+    build_number: str = "lastBuild",
+) -> dict:
+    """Search for a keyword in a build's console log.
 
+    Returns up to 20 matching lines, each with 2 lines of surrounding context
+    for readability.
 
-@mcp.tool()
-def get_build_success_rate(job_name: str, instance_name: str = None, count: int = 20) -> list:
-    """Get the success rate of a job over the last N builds."""
-    targets = {instance_name: INSTANCES[instance_name]} if instance_name and instance_name in INSTANCES else INSTANCES
-    results = []
-    for name, instance in targets.items():
-        try:
-            data = jenkins_get(
-                instance,
-                f"/job/{job_name}/api/json?tree=builds[number,result]{{0,{count}}}"
-            )
-            builds = data.get("builds", [])
-            if not builds:
-                continue
-            completed = [b for b in builds if b.get("result")]
-            if not completed:
-                continue
-            success = sum(1 for b in completed if b["result"] == "SUCCESS")
-            failure = sum(1 for b in completed if b["result"] == "FAILURE")
-            aborted = sum(1 for b in completed if b["result"] == "ABORTED")
-            rate = round((success / len(completed)) * 100, 1)
-            results.append({
-                "instance": name,
-                "job": job_name,
-                "builds_checked": len(completed),
-                "success": success,
-                "failure": failure,
-                "aborted": aborted,
-                "success_rate": f"{rate}%",
-            })
-        except requests.HTTPError as e:
-            if e.response.status_code != 404:
-                results.append({"instance": name, "error": str(e)})
-        except Exception as e:
-            results.append({"instance": name, "error": str(e)})
-    return results
+    Args:
+        job_name: The Jenkins job name.
+        instance_name: The target Jenkins instance (required).
+        keyword: Case-insensitive search term.
+        build_number: Build number or ``"lastBuild"`` (default).
 
-
-@mcp.tool()
-def search_build_log(job_name: str, instance_name: str, keyword: str, build_number: str = "lastBuild") -> dict:
-    """Search for a keyword in a build's console log and return matching lines with surrounding context."""
+    Returns:
+        Dict with ``match_count`` and a ``matches`` list of
+        ``{"line": int, "context": str}`` entries.
+    """
     if instance_name not in INSTANCES:
-        return {"error": f"Unknown instance: {instance_name}"}
+        return {"error": f"Unknown instance: {instance_name}. Available: {list(INSTANCES)}"}
     instance = INSTANCES[instance_name]
     try:
         r = requests.get(
@@ -530,10 +320,12 @@ def search_build_log(job_name: str, instance_name: str, keyword: str, build_numb
             if keyword.lower() in line.lower():
                 context_start = max(0, i - 2)
                 context_end = min(len(lines), i + 3)
-                matches.append({
-                    "line": i + 1,
-                    "context": "\n".join(lines[context_start:context_end]),
-                })
+                matches.append(
+                    {
+                        "line": i + 1,
+                        "context": "\n".join(lines[context_start:context_end]),
+                    }
+                )
         return {
             "instance": instance_name,
             "build_number": build_number,
@@ -544,6 +336,159 @@ def search_build_log(job_name: str, instance_name: str, keyword: str, build_numb
     except Exception as e:
         return {"instance": instance_name, "error": str(e)}
 
+
+# ---------------------------------------------------------------------------
+# Tool: list_artifacts
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def list_artifacts(
+    job_name: str,
+    instance_name: str,
+    build_number: str = "lastBuild",
+) -> dict:
+    """List all artifacts available for a build.
+
+    Args:
+        job_name: The Jenkins job name.
+        instance_name: The target Jenkins instance (required).
+        build_number: Build number or ``"lastBuild"`` (default).
+
+    Returns:
+        Dict with ``artifacts`` list of ``{"fileName": str, "relativePath": str}``.
+    """
+    if instance_name not in INSTANCES:
+        return {"error": f"Unknown instance: {instance_name}. Available: {list(INSTANCES)}"}
+    instance = INSTANCES[instance_name]
+    try:
+        data = jenkins_get(
+            instance,
+            f"/job/{job_name}/{build_number}/api/json?tree=artifacts[fileName,relativePath]",
+        )
+        return {
+            "instance": instance_name,
+            "build_number": build_number,
+            "artifacts": data.get("artifacts", []),
+        }
+    except Exception as e:
+        return {"instance": instance_name, "error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Tool: get_artifact_content
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_artifact_content(
+    job_name: str,
+    instance_name: str,
+    artifact_path: str,
+    build_number: str = "lastBuild",
+    tail_lines: int = 100,
+) -> dict:
+    """Download and tail a build artifact file.
+
+    Call ``list_artifacts`` first to discover available ``artifact_path`` values.
+
+    Args:
+        job_name: The Jenkins job name.
+        instance_name: The target Jenkins instance (required).
+        artifact_path: Relative path of the artifact (from ``list_artifacts``).
+        build_number: Build number or ``"lastBuild"`` (default).
+        tail_lines: Number of lines from the end of the file to return (default 100).
+
+    Returns:
+        Dict with ``total_lines``, ``returned_lines``, and ``content``.
+    """
+    if instance_name not in INSTANCES:
+        return {"error": f"Unknown instance: {instance_name}. Available: {list(INSTANCES)}"}
+    instance = INSTANCES[instance_name]
+    try:
+        r = requests.get(
+            f"{instance['url']}/job/{job_name}/{build_number}/artifact/{artifact_path}",
+            auth=get_auth(instance),
+            timeout=15,
+        )
+        r.raise_for_status()
+        lines = r.text.splitlines()
+        tail = lines[-tail_lines:]
+        return {
+            "instance": instance_name,
+            "build_number": build_number,
+            "artifact_path": artifact_path,
+            "total_lines": len(lines),
+            "returned_lines": len(tail),
+            "content": "\n".join(tail),
+        }
+    except Exception as e:
+        return {"instance": instance_name, "error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Tool: search_artifact_content
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def search_artifact_content(
+    job_name: str,
+    instance_name: str,
+    artifact_path: str,
+    keyword: str,
+    build_number: str = "lastBuild",
+) -> dict:
+    """Search for a keyword inside a build artifact file.
+
+    Returns up to 20 matching lines with surrounding context.
+
+    Args:
+        job_name: The Jenkins job name.
+        instance_name: The target Jenkins instance (required).
+        artifact_path: Relative path of the artifact (from ``list_artifacts``).
+        keyword: Case-insensitive search term.
+        build_number: Build number or ``"lastBuild"`` (default).
+
+    Returns:
+        Dict with ``match_count`` and a ``matches`` list of
+        ``{"line": int, "context": str}`` entries.
+    """
+    if instance_name not in INSTANCES:
+        return {"error": f"Unknown instance: {instance_name}. Available: {list(INSTANCES)}"}
+    instance = INSTANCES[instance_name]
+    try:
+        r = requests.get(
+            f"{instance['url']}/job/{job_name}/{build_number}/artifact/{artifact_path}",
+            auth=get_auth(instance),
+            timeout=15,
+        )
+        r.raise_for_status()
+        lines = r.text.splitlines()
+        matches = []
+        for i, line in enumerate(lines):
+            if keyword.lower() in line.lower():
+                context_start = max(0, i - 2)
+                context_end = min(len(lines), i + 3)
+                matches.append(
+                    {
+                        "line": i + 1,
+                        "context": "\n".join(lines[context_start:context_end]),
+                    }
+                )
+        return {
+            "instance": instance_name,
+            "build_number": build_number,
+            "artifact_path": artifact_path,
+            "keyword": keyword,
+            "total_lines": len(lines),
+            "match_count": len(matches),
+            "matches": matches[:20],
+        }
+    except Exception as e:
+        return {"instance": instance_name, "error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     mcp.run()
